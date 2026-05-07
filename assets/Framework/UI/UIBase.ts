@@ -35,8 +35,11 @@ export class UIBase extends Component {
 
     /** 框架内部调用，请勿手动调用 */
     public __OnClose(): void {
-        this.OnClose();
-        EventMgr.OffAll(this);
+        try {
+            this.OnClose();
+        } finally {
+            EventMgr.OffAll(this);
+        }
     }
 
     /** 框架内部调用，请勿手动调用 */

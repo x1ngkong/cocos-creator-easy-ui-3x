@@ -51,10 +51,12 @@ export class UIManager {
     private readonly mRecordMap = new Map<string, IUIRecord>();
     /** 弹窗队列 */
     private readonly mPopupQueue: IUIOpenRequest[] = [];
-    /** 异步加载中的 uiId 集合，Close 在无 record 时可标记取消 */
-    private readonly mPendingOpens = new Set<string>();
-    /** 已被取消的 pending uiId；OpenImmediate await 后命中则丢弃结果 */
-    private readonly mCancelledOpens = new Set<string>();
+    /** 异步加载中的 uiId 计数，Close 在无 record 时可标记取消 */
+    private readonly mPendingOpens = new Map<string, number>();
+    /** 每个 uiId 当前 Open 请求版本，用于区分同 uiId 并发打开 */
+    private readonly mOpenVersions = new Map<string, number>();
+    /** 已取消到哪个 Open 请求版本，避免一次取消被并发请求提前消费 */
+    private readonly mCancelledOpenVersions = new Map<string, number>();
 
     /** 队列托管的弹窗是否正在展示中（等待关闭后推进队列） */
     private mHasQueueManagedPopup = false;
@@ -88,30 +90,35 @@ export class UIManager {
 
     /** 打开 UI（同步入口）。弹窗组自动排队，关闭当前弹窗后自动开启下一个 */
     public Open(uiId: string, data?: any, options?: UIOpenOptions): void {
+        this.OpenAsync(uiId, data, options).catch(err => {
+            console.error(`[UIManager] Open "${uiId}" failed:`, err);
+        });
+    }
+
+    /** 打开 UI（异步入口）。返回实际打开的 UI；排队弹窗仅入队并返回 null */
+    public async OpenAsync(uiId: string, data?: any, options?: UIOpenOptions): Promise<UIBase | null> {
         this.EnsureRoot();
 
         const config = UIRegistry.Get(uiId);
         if (!config) {
             console.error(`[UIManager] Open: config not found for "${uiId}"`);
-            return;
+            return null;
         }
 
         if (this.ShouldQueueOpen(config, options)) {
             this.mPopupQueue.push({ uiId, data });
             this.TryOpenNextPopup();
-            return;
+            return null;
         }
 
-        this.OpenImmediate(uiId, data).catch(err => {
-            console.error(`[UIManager] Open "${uiId}" failed:`, err);
-        });
+        return this.OpenImmediate(uiId, data);
     }
 
     /** 关闭 UI */
     public Close(uiId: string): void {
         const record = this.mRecordMap.get(uiId);
         if (!record) {
-            if (this.mPendingOpens.has(uiId)) this.CancelPendingOpen(uiId);
+            this.CancelPendingOpen(uiId);
             return;
         }
 
@@ -159,9 +166,9 @@ export class UIManager {
             this.mHasQueueManagedPopup = false;
         }
 
-        this.mPendingOpens.forEach(uiId => {
+        this.mPendingOpens.forEach((_, uiId) => {
             const config = UIRegistry.Get(uiId);
-            if (config?.group === group) this.mCancelledOpens.add(uiId);
+            if (config?.group === group) this.CancelPendingOpen(uiId);
         });
 
         const stack = this.GetStack(group);
@@ -177,12 +184,12 @@ export class UIManager {
      */
     public CloseAll(): void {
         this.mPopupQueue.length = 0;
-        this.mPendingOpens.forEach(uiId => this.mCancelledOpens.add(uiId));
+        this.mPendingOpens.forEach((_, uiId) => this.CancelPendingOpen(uiId));
 
         const ids = Array.from(this.mRecordMap.keys());
         for (const uiId of ids) this.Close(uiId);
 
-        this.mPendingOpens.forEach(uiId => this.mCancelledOpens.add(uiId));
+        this.mPendingOpens.forEach((_, uiId) => this.CancelPendingOpen(uiId));
         this.mHasQueueManagedPopup = false;
     }
 
@@ -291,15 +298,23 @@ export class UIManager {
             return existing.ui;
         }
 
-        this.mPendingOpens.add(uiId);
-        const prefab = await this.LoadPrefab(config.prefabPath);
+        const openVersion = this.BeginPendingOpen(uiId);
+        let prefab: Prefab | null = null;
+        try {
+            prefab = await this.LoadPrefab(config.prefabPath);
+        } finally {
+            this.EndPendingOpen(uiId);
+        }
 
-        this.mPendingOpens.delete(uiId);
-        if (this.mCancelledOpens.delete(uiId)) return null;
+        if (this.IsOpenCancelled(uiId, openVersion)) {
+            if (prefab) ResMgr.Release(config.prefabPath);
+            return null;
+        }
         if (!prefab) return null;
 
         const race = this.mRecordMap.get(uiId);
         if (race) {
+            ResMgr.Release(config.prefabPath);
             if (queueManaged) race.isQueueManaged = true;
             race.lastOpenData = data;
             if (!race.visible) {
@@ -313,7 +328,12 @@ export class UIManager {
             return race.ui;
         }
 
-        const node = instantiate(prefab);
+        let node: Node;
+        try {
+            node = instantiate(prefab);
+        } finally {
+            ResMgr.Release(config.prefabPath);
+        }
         node.active = false;
         const ui = node.getComponent(UIBase);
         if (!ui) {
@@ -384,7 +404,11 @@ export class UIManager {
             this.ClearDestroyTimer(under);
             this.mRecordMap.delete(under.uiId);
             stack.pop();
-            under.ui?.__OnClose();
+            try {
+                under.ui?.__OnClose();
+            } catch (e) {
+                console.error(`[UIManager] OnClose("${under.uiId}") error:`, e);
+            }
             if (isValid(under.node)) under.node.destroy();
             this.OpenImmediate(under.uiId, cachedData).catch(err => {
                 console.error(`[UIManager] Recover ReCreate "${under.uiId}" failed:`, err);
@@ -474,12 +498,35 @@ export class UIManager {
         return true;
     }
 
+    /** 标记一次异步 Open 开始，并返回本次请求版本 */
+    private BeginPendingOpen(uiId: string): number {
+        const version = (this.mOpenVersions.get(uiId) ?? 0) + 1;
+        this.mOpenVersions.set(uiId, version);
+        this.mPendingOpens.set(uiId, (this.mPendingOpens.get(uiId) ?? 0) + 1);
+        return version;
+    }
+
+    /** 标记一次异步 Open 结束 */
+    private EndPendingOpen(uiId: string): void {
+        const count = (this.mPendingOpens.get(uiId) ?? 0) - 1;
+        if (count > 0) {
+            this.mPendingOpens.set(uiId, count);
+        } else {
+            this.mPendingOpens.delete(uiId);
+        }
+    }
+
+    /** 判断指定版本的 Open 是否已被取消 */
+    private IsOpenCancelled(uiId: string, openVersion: number): boolean {
+        return (this.mCancelledOpenVersions.get(uiId) ?? 0) >= openVersion;
+    }
+
     /**
      * 取消"异步加载中"的 Open 请求（由 Close 在 uiId 尚未建立 record 时触发）。
      * 同时清空 popup 队列中同 uiId 的排队，防止取消后被连环打开。
      */
     private CancelPendingOpen(uiId: string): void {
-        this.mCancelledOpens.add(uiId);
+        this.mCancelledOpenVersions.set(uiId, this.mOpenVersions.get(uiId) ?? 0);
         for (let i = this.mPopupQueue.length - 1; i >= 0; i--) {
             if (this.mPopupQueue[i].uiId === uiId) {
                 this.mPopupQueue.splice(i, 1);

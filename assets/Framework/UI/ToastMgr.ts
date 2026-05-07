@@ -85,13 +85,24 @@ export class ToastMgr {
         this.mIsPlaying = true;
         const token = ++this.mToken;
 
-        UIManager.Instance.Open(this.mToastUIId, { text: next.text, duration: next.duration });
+        UIManager.Instance.OpenAsync(this.mToastUIId, { text: next.text, duration: next.duration })
+            .then(ui => {
+                if (token !== this.mToken) return;
+                if (!ui) {
+                    this.Finish(token, this.mInterval);
+                    return;
+                }
 
-        TimerMgr.Once(() => {
-            if (token !== this.mToken) return;
-            UIManager.Instance.Close(this.mToastUIId);
-            this.Finish(token, this.mInterval);
-        }, next.duration, this);
+                TimerMgr.Once(() => {
+                    if (token !== this.mToken) return;
+                    UIManager.Instance.Close(this.mToastUIId);
+                    this.Finish(token, this.mInterval);
+                }, next.duration, this);
+            })
+            .catch(err => {
+                console.error(`[ToastMgr] Open "${this.mToastUIId}" failed:`, err);
+                this.Finish(token, this.mInterval);
+            });
     }
 
     /** 完成 Toast 播放 */

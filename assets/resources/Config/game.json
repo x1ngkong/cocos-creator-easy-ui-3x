@@ -1,0 +1,23 @@
+{
+    "model": "UIGroupRoot",
+    "group": {
+        "FullScreen": {
+            "zIndex": 100
+        },
+        "Popup": {
+            "zIndex": 200
+        },
+        "Bubble": {
+            "zIndex": 300
+        },
+        "Guide": {
+            "zIndex": 400
+        },
+        "GameMaster": {
+            "zIndex": 500
+        },
+        "Toast": {
+            "zIndex": 600
+        }
+    }
+}

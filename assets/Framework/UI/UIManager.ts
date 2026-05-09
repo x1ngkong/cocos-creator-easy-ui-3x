@@ -134,7 +134,7 @@ export class UIManager {
         } catch (e) {
             console.error(`[UIManager] OnClose("${uiId}") error:`, e);
         }
-        if (isValid(record.node)) record.node.destroy();
+        this.DestroyRecordNode(record);
 
         if (record.config.group === UIGroupType.FullScreen) {
             this.RecoverUnderFullScreen();
@@ -331,14 +331,16 @@ export class UIManager {
         let node: Node;
         try {
             node = instantiate(prefab);
-        } finally {
+        } catch (e) {
             ResMgr.Release(config.prefabPath);
+            throw e;
         }
         node.active = false;
         const ui = node.getComponent(UIBase);
         if (!ui) {
             console.error(`[UIManager] Open "${uiId}" failed: prefab must have UIBase component.`);
             node.destroy();
+            ResMgr.Release(config.prefabPath);
             return null;
         }
 
@@ -409,7 +411,7 @@ export class UIManager {
             } catch (e) {
                 console.error(`[UIManager] OnClose("${under.uiId}") error:`, e);
             }
-            if (isValid(under.node)) under.node.destroy();
+            this.DestroyRecordNode(under);
             this.OpenImmediate(under.uiId, cachedData).catch(err => {
                 console.error(`[UIManager] Recover ReCreate "${under.uiId}" failed:`, err);
             });
@@ -475,11 +477,18 @@ export class UIManager {
         } catch (e) {
             console.error(`[UIManager] OnClose("${uiId}") error:`, e);
         }
-        if (isValid(record.node)) record.node.destroy();
+        this.DestroyRecordNode(record);
 
         if (record.config.group === UIGroupType.Popup) {
             this.RefreshPopupMask();
         }
+    }
+
+    /** 销毁 UI 节点并释放其打开时持有的预制体引用 */
+    private DestroyRecordNode(record: IUIRecord): void {
+        this.StopPopupTween(record.node);
+        if (isValid(record.node)) record.node.destroy();
+        ResMgr.Release(record.config.prefabPath);
     }
 
     /** 清除销毁定时器 */

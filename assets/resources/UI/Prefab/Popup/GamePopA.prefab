@@ -394,7 +394,7 @@
     "_lpos": {
       "__type__": "cc.Vec3",
       "x": 0,
-      "y": 132,
+      "y": 103.849,
       "z": 0
     },
     "_lrot": {
@@ -471,7 +471,7 @@
       "a": 255
     },
     "_string": "",
-    "_horizontalAlign": 1,
+    "_horizontalAlign": 0,
     "_verticalAlign": 1,
     "_actualFontSize": 30,
     "_fontSize": 30,
@@ -723,8 +723,8 @@
       "__id__": 1
     },
     "component": "",
-    "_componentId": "9d655c/XVZFOql2v/jlI0G2",
-    "handler": "OnClickBackLobby",
+    "_componentId": "58923Rz0GZG4Jn/CdOwx6JY",
+    "handler": "OnClickClose",
     "customEventData": ""
   },
   {

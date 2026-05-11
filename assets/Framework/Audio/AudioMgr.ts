@@ -3,51 +3,54 @@
  * @Author      : xingkong6
  * @Date        : 2026-05-06
  * @License     : Copyright (c) 2026 xingkong6. Internal use only, no redistribution or resale.
- * @Description : 音频管理器（BGM 单通道淡入淡出 + SFX 多通道播放）
+ * @Description : 音频管理器（BGM 单通道淡入淡出 + SFX 多通道并发）
+ *
+ * SFX 通道池：
+ *   - 默认 3 个独立 AudioSource 通道并发播放
+ *   - 有空闲通道时直接占用；全满时抢占剩余时长最短的通道
+ *   - SetSFXChannelCount 可在运行时动态调整通道数
  *************************************************************************************/
 
 import { AudioClip, AudioSource, director, Node } from "cc";
 import { ResMgr } from "../Res/ResMgr";
 import { ITimerHandle, TimerMgr } from "../Util/TimerMgr";
 
-export class AudioMgr {
-    /** BGM 淡变步数 */
-    private static readonly mFadeSteps = 20;
+/** SFX 播放通道 */
+interface ISfxChannel {
+    source: AudioSource;
+    /** 当前播放的资源路径；空字符串表示空闲 */
+    path: string;
+    /** 预计播放结束时间戳（Date.now()/1000），0 表示空闲 */
+    endAt: number;
+}
 
-    /** BGM 音量 */
+export class AudioMgr {
     private static mBgmVolume = 1.0;
-    /** SFX 音量 */
     private static mSfxVolume = 1.0;
-    /** BGM 是否静音 */
     private static mBgmMuted = false;
-    /** SFX 是否静音 */
     private static mSfxMuted = false;
 
-    /** 音频根节点 */
     private static mAudioRoot: Node | null = null;
-    /** BGM 音频源 */
     private static mBgmSource: AudioSource | null = null;
-    /** SFX 音频源 */
-    private static mSfxSource: AudioSource | null = null;
+    /** SFX 通道池 */
+    private static mSfxChannels: ISfxChannel[] = [];
+    /** SFX 最大并发通道数（默认 3） */
+    private static mSfxChannelCount = 3;
 
-    /** 当前目标 BGM 路径（PlayBGM 时立即设置，用于并发 stale 检查） */
     private static mBgmPath = "";
-    /** 当前持有 ResMgr load 引用的 BGM 路径（需在停止或切换时 Release） */
     private static mBgmLoadedPath = "";
-    /** 当前是否正在加载 BGM（防止同路径并发两次 PlayBGM 各自 doPlay，导致双重播放通道泄漏） */
     private static mBgmLoading = false;
-    /** 是否正在淡出 */
-    private static mFading = false;
-    /** 当前正在运行的淡变定时器句柄，用于 StopFading 时精确取消 */
     private static mFadeHandle: ITimerHandle | null = null;
+
+    // ─── BGM ──────────────────────────────────────────────────────────────────
 
     /**
      * 播放 BGM（自动替换当前 BGM，默认循环）。
-     * @param path       resources 下的资源路径，不含后缀
-     * @param fadeOut    切换旧 BGM 的淡出时长（秒），0 表示立即停止
-     * @param fadeIn     新 BGM 的淡入时长（秒），0 表示立即达到目标音量
+     * @param path    resources 下的资源路径，不含后缀
+     * @param fadeOut 旧 BGM 淡出时长（秒），0 表示立即停止
+     * @param fadeIn  新 BGM 淡入时长（秒），0 表示立即达到目标音量
      */
-    public static PlayBGM(path: string, fadeOut: number = 0.3, fadeIn: number = 0.3): void {
+    public static PlayBGM(path: string, fadeOut = 0.3, fadeIn = 0.3): void {
         const bgmSource = this.GetBgmSource();
         if (this.mBgmPath === path && (bgmSource.playing || this.mBgmLoading)) return;
         this.mBgmPath = path;
@@ -56,9 +59,7 @@ export class AudioMgr {
         const doPlay = () => {
             this.mBgmLoading = true;
             ResMgr.Load<AudioClip>(path, AudioClip).then(clip => {
-                if (this.mBgmPath === path) {
-                    this.mBgmLoading = false;
-                }
+                if (this.mBgmPath === path) this.mBgmLoading = false;
 
                 if (!clip) {
                     if (this.mBgmLoadedPath) {
@@ -69,10 +70,14 @@ export class AudioMgr {
                     console.warn(`[AudioMgr] PlayBGM load failed: "${path}"`);
                     return;
                 }
+
+                // 加载期间目标已切换，丢弃本次结果
                 if (this.mBgmPath !== path) {
                     ResMgr.Release(path);
                     return;
                 }
+
+                // 释放旧 BGM 的引用
                 if (this.mBgmLoadedPath && this.mBgmLoadedPath !== path) {
                     ResMgr.Release(this.mBgmLoadedPath);
                 }
@@ -84,6 +89,7 @@ export class AudioMgr {
                 source.loop = true;
                 source.volume = (this.mBgmMuted || fadeIn > 0) ? 0 : this.mBgmVolume;
                 source.play();
+
                 if (!this.mBgmMuted && fadeIn > 0) {
                     this.FadeVolume(0, this.mBgmVolume, fadeIn);
                 }
@@ -92,9 +98,7 @@ export class AudioMgr {
 
         if (bgmSource.playing && fadeOut > 0) {
             this.StopFading();
-            this.mFading = true;
             this.FadeVolume(bgmSource.volume, 0, fadeOut, () => {
-                this.mFading = false;
                 bgmSource.stop();
                 doPlay();
             });
@@ -108,7 +112,7 @@ export class AudioMgr {
     /** 停止 BGM */
     public static StopBGM(fadeOut = 0.3): void {
         const bgmSource = this.GetBgmSource();
-        if (!bgmSource.playing && !this.mBgmPath && !this.mFading) return;
+        if (!bgmSource.playing && !this.mBgmPath && !this.mFadeHandle) return;
 
         this.mBgmPath = "";
         this.mBgmLoading = false;
@@ -123,9 +127,7 @@ export class AudioMgr {
         if (!bgmSource.playing) return;
 
         if (fadeOut > 0) {
-            this.mFading = true;
             this.FadeVolume(bgmSource.volume, 0, fadeOut, () => {
-                this.mFading = false;
                 bgmSource.stop();
             });
         } else {
@@ -133,12 +135,10 @@ export class AudioMgr {
         }
     }
 
-    /** 暂停 BGM（含正在淡出的旧 BGM） */
-    public static PauseBGM(): void {
-        this.GetBgmSource().pause();
-    }
+    /** 暂停 BGM */
+    public static PauseBGM(): void { this.GetBgmSource().pause(); }
 
-    /** 恢复 BGM（含正在淡出的旧 BGM） */
+    /** 恢复 BGM */
     public static ResumeBGM(): void {
         const source = this.GetBgmSource();
         if (source.clip) source.play();
@@ -147,10 +147,7 @@ export class AudioMgr {
     /** 设置 BGM 音量（0 ~ 1） */
     public static SetBGMVolume(volume: number): void {
         this.mBgmVolume = Math.max(0, Math.min(1, volume));
-        const source = this.GetBgmSource();
-        if (!this.mBgmMuted) {
-            source.volume = this.mBgmVolume;
-        }
+        if (!this.mBgmMuted) this.GetBgmSource().volume = this.mBgmVolume;
     }
 
     /** 静音 / 取消静音 BGM */
@@ -160,23 +157,71 @@ export class AudioMgr {
         this.GetBgmSource().volume = mute ? 0 : this.mBgmVolume;
     }
 
+    // ─── SFX ──────────────────────────────────────────────────────────────────
+
+    /**
+     * 设置 SFX 最大并发通道数（默认 3，最小 1）。
+     * - 若音频根节点尚未初始化，仅记录配置，首次播放时生效
+     * - 已初始化后调用：立即停止所有 SFX 并重建通道池
+     */
+    public static SetSFXChannelCount(count: number): void {
+        count = Math.max(1, Math.floor(count));
+        if (this.mSfxChannelCount === count) return;
+        this.mSfxChannelCount = count;
+        if (!this.mAudioRoot?.isValid) return;
+
+        this.StopAllSFX();
+        while (this.mSfxChannels.length < count) {
+            this.mSfxChannels.push({ source: this.mAudioRoot.addComponent(AudioSource), path: "", endAt: 0 });
+        }
+        while (this.mSfxChannels.length > count) {
+            const ch = this.mSfxChannels.pop()!;
+            ch.source.destroy();
+        }
+    }
+
     /**
      * 播放音效（fire-and-forget）。
-     * @param path    resources 下的资源路径，不含后缀
-     * @param volume  音量（0 ~ 1），不传则使用全局 SFX 音量
+     * 自动占用空闲通道；全满时抢占剩余时长最短的通道。
+     * @param path   resources 下的资源路径，不含后缀
+     * @param volume 音量（0 ~ 1），不传则使用全局 SFX 音量
      */
     public static PlaySFX(path: string, volume?: number): void {
         if (this.mSfxMuted) return;
         ResMgr.Load<AudioClip>(path, AudioClip).then(clip => {
             if (!clip) return;
-            if (this.mSfxMuted) {
-                ResMgr.Release(path);
-                return;
-            }
+            if (this.mSfxMuted) { ResMgr.Release(path); return; }
+
             const vol = Math.max(0, Math.min(1, volume ?? this.mSfxVolume));
-            this.GetSfxSource().playOneShot(clip, vol);
-            ResMgr.Release(path);
+            const ch = this.AcquireSfxChannel();
+            ch.source.stop();
+            ch.source.clip = clip;
+            ch.source.loop = false;
+            ch.source.volume = vol;
+            ch.source.play();
+
+            const duration = clip.getDuration?.() ?? 5;
+            ch.path = path;
+            ch.endAt = Date.now() / 1000 + duration;
+            // 播放结束后延迟 0.1s 再释放，避免引擎异步尾部被截断
+            TimerMgr.Once(() => {
+                ch.path = "";
+                ch.endAt = 0;
+                ResMgr.Release(path);
+            }, duration + 0.1, ch.source);
         });
+    }
+
+    /** 立即停止所有 SFX 通道并释放资源引用 */
+    public static StopAllSFX(): void {
+        for (const ch of this.mSfxChannels) {
+            if (!ch.path) continue;
+            TimerMgr.CancelByOwner(ch.source);
+            ResMgr.Release(ch.path);
+            ch.path = "";
+            ch.endAt = 0;
+            ch.source.stop();
+        }
     }
 
     /** 设置 SFX 全局音量（0 ~ 1） */
@@ -185,45 +230,60 @@ export class AudioMgr {
     }
 
     /** 静音 / 取消静音 SFX */
-    public static MuteSFX(mute: boolean): void {
-        this.mSfxMuted = mute;
-    }
+    public static MuteSFX(mute: boolean): void { this.mSfxMuted = mute; }
+
+    // ─── 全局 ──────────────────────────────────────────────────────────────────
 
     /** 全局静音 / 取消静音（同时控制 BGM 和 SFX） */
-    public static SetMute(mute: boolean): void {
-        this.MuteBGM(mute);
-        this.MuteSFX(mute);
-    }
+    public static SetMute(mute: boolean): void { this.MuteBGM(mute); this.MuteSFX(mute); }
 
-    /** 停止所有音频（包含 BGM） */
+    /** 停止所有音频（BGM + 全部 SFX 通道） */
     public static StopAll(): void {
-        this.StopFading();
-        const bgmSource = this.GetBgmSource();
-        bgmSource.stop();
-        bgmSource.clip = null;
-        if (this.mBgmLoadedPath) {
-            ResMgr.Release(this.mBgmLoadedPath);
-            this.mBgmLoadedPath = "";
-        }
-        this.mBgmPath = "";
-        this.mBgmLoading = false;
+        this.StopBGM(0);
+        this.StopAllSFX();
     }
 
     /** 预加载音频资源（提前缓存，播放时无延迟） */
-    public static Preload(path: string): void {
-        ResMgr.Preload(path, AudioClip);
-    }
+    public static Preload(path: string): void { ResMgr.Preload(path, AudioClip); }
 
-    /** 立即停止当前正在淡出的音频（若有），同时取消对应的调度 tick */
-    private static StopFading(): void {
-        if (this.mFadeHandle) {
-            this.mFadeHandle.Cancel();
-            this.mFadeHandle = null;
+    // ─── 私有 ──────────────────────────────────────────────────────────────────
+
+    /**
+     * 获取一个可用的 SFX 通道。
+     * 优先找空闲（未在播放 或 endAt 已过）；全满时抢占 endAt 最小的通道。
+     */
+    private static AcquireSfxChannel(): ISfxChannel {
+        this.EnsureAudioRoot();
+        const now = Date.now() / 1000;
+
+        // 找第一个空闲通道（含已到 endAt 但定时器还未触发的）
+        const idle = this.mSfxChannels.find(c => !c.source.playing || c.endAt <= now);
+        if (idle) {
+            if (idle.path) {
+                // endAt 已过但定时器未触发时，手动提前释放
+                TimerMgr.CancelByOwner(idle.source);
+                ResMgr.Release(idle.path);
+                idle.path = "";
+            }
+            return idle;
         }
-        this.mFading = false;
+
+        // 全满：抢占剩余时长最短（endAt 最小）的通道
+        const victim = this.mSfxChannels.reduce((a, b) => a.endAt < b.endAt ? a : b);
+        TimerMgr.CancelByOwner(victim.source);
+        ResMgr.Release(victim.path);
+        victim.path = "";
+        victim.source.stop();
+        return victim;
     }
 
-    /** BGM 音量渐变 */
+    /** 停止 BGM 淡入淡出 */
+    private static StopFading(): void {
+        this.mFadeHandle?.Cancel();
+        this.mFadeHandle = null;
+    }
+
+    /** 线性插值淡变 BGM 音量，基于实际流逝时间，不依赖步数计算 */
     private static FadeVolume(from: number, to: number, duration: number, onComplete?: () => void): void {
         const source = this.GetBgmSource();
         if (duration <= 0) {
@@ -231,49 +291,53 @@ export class AudioMgr {
             onComplete?.();
             return;
         }
-        const steps = Math.max(1, Math.round(this.mFadeSteps * duration));
-        const stepTime = duration / steps;
-        const stepVol = (to - from) / steps;
-        let current = from;
-        let remaining = steps;
-
-        let handle: ITimerHandle | null = null;
-        const tick = () => {
-            remaining--;
-            current += stepVol;
-            source.volume = Math.max(0, Math.min(1, current));
-            if (remaining > 0) return;
-            handle?.Cancel();
-            if (this.mFadeHandle === handle) {
+        const startTime = Date.now();
+        this.mFadeHandle = TimerMgr.Loop(() => {
+            const t = Math.min(1, (Date.now() - startTime) / (duration * 1000));
+            source.volume = Math.max(0, Math.min(1, from + (to - from) * t));
+            if (t >= 1) {
+                this.mFadeHandle?.Cancel();
                 this.mFadeHandle = null;
+                onComplete?.();
             }
-            onComplete?.();
-        };
-        handle = TimerMgr.Loop(tick, stepTime, this);
-        this.mFadeHandle = handle;
+        }, 0.05, this);
     }
 
-    /** 获取 BGM 音频源 */
+    /** 获取 BGM AudioSource */
     private static GetBgmSource(): AudioSource {
         this.EnsureAudioRoot();
         return this.mBgmSource!;
     }
 
-    /** 获取 SFX 音频源 */
-    private static GetSfxSource(): AudioSource {
-        this.EnsureAudioRoot();
-        return this.mSfxSource!;
+    /** 确保音频根节点存在（含热重载后静态引用丢失时复用已有持久节点） */
+    private static EnsureAudioRoot(): void {
+        if (this.mAudioRoot?.isValid) return;
+
+        this.mAudioRoot = this.FindOrCreatePersistNode("AudioMgr");
+        this.mBgmSource = this.GetOrAddSource(this.mAudioRoot, 0);
+        this.mSfxChannels = Array.from({ length: this.mSfxChannelCount }, (_, i) => ({
+            source: this.GetOrAddSource(this.mAudioRoot!, i + 1),
+            path: "",
+            endAt: 0,
+        }));
     }
 
-    /** 确保音频根节点存在 */
-    private static EnsureAudioRoot(): void {
-        if (this.mAudioRoot && this.mAudioRoot.isValid) return;
-
-        const node = new Node("AudioMgr");
+    /** 在持久节点列表中查找同名节点，找不到则新建并注册为持久节点 */
+    private static FindOrCreatePersistNode(name: string): Node {
+        const pMap = (director as any)._persistRootNodes as Map<string, Node> | undefined;
+        if (pMap) {
+            for (const node of pMap.values()) {
+                if (node.name === name && node.isValid) return node;
+            }
+        }
+        const node = new Node(name);
         director.addPersistRootNode(node);
+        return node;
+    }
 
-        this.mAudioRoot = node;
-        this.mBgmSource = node.addComponent(AudioSource);
-        this.mSfxSource = node.addComponent(AudioSource);
+    /** 获取节点上第 index 个 AudioSource，不足时追加 */
+    private static GetOrAddSource(node: Node, index: number): AudioSource {
+        const all = node.getComponents(AudioSource);
+        return all[index] ?? node.addComponent(AudioSource);
     }
 }

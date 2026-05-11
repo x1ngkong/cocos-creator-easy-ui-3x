@@ -67,6 +67,10 @@ export class ResMgr {
     private static readonly mGcInterval = 30;
     /** GC 定时器句柄（首次 Load 成功时启动一次，进程内不再重置） */
     private static mGcTimer: ITimerHandle | null = null;
+    /** 是否允许自动 GC（默认 true；调用 SetGcEnabled(false) 可关闭） */
+    private static mGcEnabled = true;
+    /** 是否打印 GC 调试日志（默认 false，按需通过 SetGcLog 开启） */
+    private static mGcLog = false;
     /**
      * 全局版本号；每次 ReleaseAll 自增。
      * 在途加载的回调通过比对版本号判断结果是否已过期，防止污染新状态。
@@ -80,6 +84,23 @@ export class ResMgr {
      */
     public static SetIdleTimeout(seconds: number): void {
         this.mIdleTimeout = Math.max(5, seconds);
+    }
+
+    /**
+     * 启用或禁用自动 GC（默认启用）。
+     * 关闭后 EnsureGcTimer 不再启动新定时器；同时取消当前正在运行的 GC 定时器。
+     */
+    public static SetGcEnabled(enabled: boolean): void {
+        this.mGcEnabled = enabled;
+        if (!enabled && this.mGcTimer && !this.mGcTimer.isDone) {
+            this.mGcTimer.Cancel();
+            this.mGcTimer = null;
+        }
+    }
+
+    /** 开启或关闭 GC 调试日志（默认关闭，线上请勿开启）。 */
+    public static SetGcLog(enabled: boolean): void {
+        this.mGcLog = enabled;
     }
 
     /**
@@ -332,7 +353,7 @@ export class ResMgr {
             this.mLastUsed.delete(path);
             if (asset) assetManager.releaseAsset(asset);
         });
-        console.log(`[ResMgr] GC released ${expired.length} idle resource(s):`, expired);
+        if (this.mGcLog) console.log(`[ResMgr] GC released ${expired.length} idle resource(s):`, expired);
     }
 
     /******************************* 查询 *******************************/
@@ -423,6 +444,7 @@ export class ResMgr {
 
     /** 确保 GC 定时器已启动（首次 Load 成功时触发，进程内仅启动一次） */
     private static EnsureGcTimer(): void {
+        if (!this.mGcEnabled) return;
         if (this.mGcTimer && !this.mGcTimer.isDone) return;
         this.mGcTimer = TimerMgr.Loop(() => this.GC(), this.mGcInterval, this);
     }

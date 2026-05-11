@@ -6,7 +6,7 @@
  * @Description : 全局按钮点击音效补丁，调用一次后所有 Button 自动播放点击音效
  *************************************************************************************/
 
-import { Button, director, Node } from "cc";
+import { Button, director, Director, Node } from "cc";
 import { AudioMgr } from "../Audio/AudioMgr";
 
 const PATCHED_FLAG = "__sfxPatched__";
@@ -21,6 +21,9 @@ type ButtonSFXNode = Node & {
     [SFX_DISABLED_FLAG]?: boolean;
 };
 
+/** patch 前保存的原始 start，供 UnpatchButtonClickSFX 恢复 */
+let origButtonStart: (() => void) | undefined;
+
 /**
  * 全局 patch Button，使所有按钮点击时自动播放指定音效。
  * 在应用启动时调用一次即可，后续新增的按钮也会自动生效。
@@ -30,6 +33,7 @@ type ButtonSFXNode = Node & {
  *   - 后续调用：仅更新 sfxPath，不重复包裹 start
  *
  * 跳过某个按钮的方法：调用 SetButtonClickSFXEnabled(button.node, false)。
+ * 撤销全局 patch：调用 UnpatchButtonClickSFX()。
  *
  * @param sfxPath  resources 下的音效路径，不含后缀
  */
@@ -39,15 +43,34 @@ export function PatchButtonClickSFX(sfxPath: string): void {
     const proto = Button.prototype as PatchedButtonPrototype;
     if (!proto[PATCHED_FLAG]) {
         proto[PATCHED_FLAG] = true;
+        origButtonStart = proto.start;
 
-        const origStart = proto.start;
         proto.start = function (): void {
-            origStart?.call(this);
+            origButtonStart?.call(this);
             BindButtonClickSFX(this);
         };
+
+        // 每次新场景加载完毕后，对场景内已存在的按钮补充绑定。
+        director.on(Director.EVENT_AFTER_SCENE_LAUNCH, BindExistingButtons);
     }
 
     BindExistingButtons();
+}
+
+/**
+ * 撤销全局 Button 音效 patch（与 PatchButtonClickSFX 对称）。
+ * 调用后：新建按钮不再绑定音效，场景切换监听被移除，原始 start 被还原。
+ * 注意：已绑定的按钮节点上的 click 监听会在节点销毁时自然释放。
+ */
+export function UnpatchButtonClickSFX(): void {
+    const proto = Button.prototype as PatchedButtonPrototype;
+    if (!proto[PATCHED_FLAG]) return;
+
+    proto[PATCHED_FLAG] = false;
+    proto.start = origButtonStart;
+    origButtonStart = undefined;
+    currentSfxPath = "";
+    director.off(Director.EVENT_AFTER_SCENE_LAUNCH, BindExistingButtons);
 }
 
 let currentSfxPath: string = "";

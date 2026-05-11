@@ -83,7 +83,8 @@ export class StorageMgr {
     public static GetBool(key: string, defaultValue: boolean = false): boolean {
         const raw = sys.localStorage.getItem(this.BuildKey(key));
         if (raw === null) return defaultValue;
-        return raw === "1";
+        // 兼容 SetBool 写入的 "1"/"0" 以及外部直接写入的 "true"/"false"
+        return raw === "1" || raw === "true";
     }
 
     /**

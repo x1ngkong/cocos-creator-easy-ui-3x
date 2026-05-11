@@ -17,6 +17,8 @@ import { ITimerHandle, TimerMgr } from "../Util/TimerMgr";
 interface IUIOpenRequest {
     uiId: string;
     data?: any;
+    /** 保留原始 options，供弹窗从队列打开时继承非 bypassQueue 选项 */
+    options?: UIOpenOptions;
 }
 
 /** UI 记录 */
@@ -42,7 +44,8 @@ export class UIManager {
     private static readonly mPopupMaskOpacity = 160;
     private static readonly mPopupEnterScaleFrom = 0.92;
     private static readonly mPopupEnterDuration = 0.18;
-
+    /** 遮罩填充色缓存，避免每次重绘 new Color */
+    private static readonly mMaskFillColor = new Color(0, 0, 0, UIManager.mPopupMaskOpacity);
     /** 分组根节点映射 */
     private readonly mGroupRoots = new Map<UIGroupType, Node>();
     /** 分组栈映射 */
@@ -62,6 +65,8 @@ export class UIManager {
     private mHasQueueManagedPopup = false;
     private mRootReady = false;
     private mPopupMaskNode: Node | null = null;
+    /** 上次绘制遮罩时的画布尺寸，尺寸不变则跳过 Graphics 重绘 */
+    private mLastMaskContentSize = { w: -1, h: -1 };
 
     /** 分组配置映射 */
     private readonly mGroupConfigMap = new Map<UIGroupType, UIGroupConfig>([
@@ -98,6 +103,7 @@ export class UIManager {
     /** 打开 UI（异步入口）。返回实际打开的 UI；排队弹窗仅入队并返回 null */
     public async OpenAsync(uiId: string, data?: any, options?: UIOpenOptions): Promise<UIBase | null> {
         this.EnsureRoot();
+        if (!this.mRootReady) return null;
 
         const config = UIRegistry.Get(uiId);
         if (!config) {
@@ -106,7 +112,7 @@ export class UIManager {
         }
 
         if (this.ShouldQueueOpen(config, options)) {
-            this.mPopupQueue.push({ uiId, data });
+            this.mPopupQueue.push({ uiId, data, options });
             this.TryOpenNextPopup();
             return null;
         }
@@ -267,7 +273,11 @@ export class UIManager {
     }
 
     private async OpenImmediate(uiId: string, data?: any, queueManaged: boolean = false): Promise<UIBase | null> {
-        const config = UIRegistry.Get(uiId)!;
+        const config = UIRegistry.Get(uiId);
+        if (!config) {
+            console.error(`[UIManager] OpenImmediate: config not found for "${uiId}"`);
+            return null;
+        }
 
         const existing = this.mRecordMap.get(uiId);
         if (existing) {
@@ -635,11 +645,13 @@ export class UIManager {
 
     /** 绘制黑色遮罩 */
     private RedrawPopupMask(maskNode: Node): void {
+        const size = this.GetUITransform(maskNode).contentSize;
+        if (size.width === this.mLastMaskContentSize.w && size.height === this.mLastMaskContentSize.h) return;
+        this.mLastMaskContentSize.w = size.width;
+        this.mLastMaskContentSize.h = size.height;
         const graphics = maskNode.getComponent(Graphics) || maskNode.addComponent(Graphics);
-        const transform = this.GetUITransform(maskNode);
-        const size = transform.contentSize;
         graphics.clear();
-        graphics.fillColor = new Color(0, 0, 0, UIManager.mPopupMaskOpacity);
+        graphics.fillColor = UIManager.mMaskFillColor;
         graphics.rect(-size.width * 0.5, -size.height * 0.5, size.width, size.height);
         graphics.fill();
     }
@@ -668,7 +680,7 @@ export class UIManager {
         );
 
         tween(record.node)
-            .to(enterDuration, { scale: new Vec3(targetScale.x, targetScale.y, targetScale.z) }, { easing: "backOut" })
+            .to(enterDuration, { scale: targetScale }, { easing: "backOut" })
             .start();
         tween(opacity)
             .to(enterDuration, { opacity: 255 })

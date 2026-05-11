@@ -54,6 +54,19 @@ export class EventDefines {
         return id;
     }
 
+    /**
+     * 开始一个新段：将 mNextId 跳至 segStart，并分配该段的第一个事件 ID。
+     * 用于替代"副作用字段"模式（`private static readonly mSegXxx = (mNextId = N)`），
+     * 语义更直观，不产生无用的私有字段。
+     *
+     * @param name     事件名称（同 Next）
+     * @param segStart 本段起始 ID（须大于上一段已用的最大 ID）
+     */
+    private static NextSeg(name: string, segStart: number): EventId {
+        this.mNextId = segStart;
+        return this.Next(name);
+    }
+
     /** Debug 模式下根据事件 ID 查询可读名称，生产环境返回 ID 字符串 */
     public static GetName(id: EventId): string {
         return this.mNameMap.get(id) ?? String(id);
@@ -68,10 +81,8 @@ export class EventDefines {
 
     // -- 玩家（段：1000 ~ 1999）------------------------------------------------
 
-    private static readonly mSegPlayer = (EventDefines.mNextId = 1000);
-
     static readonly PLAYER = {
-        CoinChanged: EventDefines.Next("PLAYER.CoinChanged"),
+        CoinChanged: EventDefines.NextSeg("PLAYER.CoinChanged", 1000),
         GemChanged: EventDefines.Next("PLAYER.GemChanged"),
         ExpChanged: EventDefines.Next("PLAYER.ExpChanged"),
         LevelUp: EventDefines.Next("PLAYER.LevelUp"),
@@ -81,10 +92,8 @@ export class EventDefines {
 
     // -- 游戏流程（段：2000 ~ 2999）--------------------------------------------
 
-    private static readonly mSegGame = (EventDefines.mNextId = 2000);
-
     static readonly GAME = {
-        SceneEnter: EventDefines.Next("GAME.SceneEnter"),
+        SceneEnter: EventDefines.NextSeg("GAME.SceneEnter", 2000),
         SceneExit: EventDefines.Next("GAME.SceneExit"),
         Pause: EventDefines.Next("GAME.Pause"),
         Resume: EventDefines.Next("GAME.Resume"),
